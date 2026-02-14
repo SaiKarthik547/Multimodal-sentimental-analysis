@@ -1,4 +1,3 @@
-````markdown
 # 🌐 Social Media Sentiment Analyzer
 
 This project is a comprehensive, multi-modal sentiment analysis tool built with Streamlit. It can ingest a URL from various social media platforms (like Reddit, YouTube, TikTok, etc.), extract text, media (images/videos/audio), and comments, and perform a deep analysis on each component.
@@ -110,7 +109,6 @@ The application uses an ensemble of transformer models to analyze sentiment from
 ```bash
 git clone [https://github.com/SaiKarthik547/Multimodal-sentimental-analysis.git](https://github.com/SaiKarthik547/Multimodal-sentimental-analysis.git)
 cd Multimodal-sentimental-analysis
-````
 
 ### 2\. Create a Virtual Environment (Recommended)
 
