@@ -1,9 +1,17 @@
 import streamlit as st
 import os
+import sys
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 import gc
 import re
 import numpy as np
 import pandas as pd # Added for dataframes and CSV reading
+import urllib.parse
 from collections import defaultdict
 import validators
 import requests
@@ -64,6 +72,7 @@ RAPIDAPI_KEY = os.getenv('RAPIDAPI_KEY', 'default_rapidapi_key') # Use default i
 REDDIT_CLIENT_ID = os.getenv('REDDIT_CLIENT_ID', 'default_reddit_id') # Use default if not set
 REDDIT_CLIENT_SECRET = os.getenv('REDDIT_CLIENT_SECRET', 'default_reddit_secret') # Use default if not set
 REDDIT_USER_AGENT = os.getenv('REDDIT_USER_AGENT', 'streamlit_app/1.0') # Use default if not set
+REDDIT_RAPIDAPI_HOST = os.getenv('REDDIT_RAPIDAPI_HOST', 'reddit34.p.rapidapi.com')
 YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY', 'default_youtube_key') # Use default if not set
 DB_NAME = "sentiment_history.db" # Database file name
 SAMPLE_CSV_PATH = "sample.csv" # --- FIX: Corrected filename ---
@@ -926,18 +935,153 @@ def initialize_audio_ensemble():
 
 
 # --- 5. DATA FETCHING ---
+def fetch_reddit_via_rapidapi(url, session):
+    """Fetches Reddit post comments and info using RapidAPI Reddit Scraper with oEmbed fallback."""
+    comments = []
+    title = ""
+    media_url = url
+
+    # 0. Resolve Reddit short share links (/s/...) to canonical post URL
+    canonical_url = url
+    try:
+        headers_unshort = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        head_resp = session.head(url, allow_redirects=True, timeout=10, headers=headers_unshort)
+        if head_resp.status_code in (200, 301, 302) and head_resp.url:
+            canonical_url = head_resp.url.split("?")[0]
+            logging.info(f"Resolved Reddit URL: {canonical_url}")
+    except Exception as unshorten_err:
+        logging.warning(f"Reddit unshorten error: {unshorten_err}")
+
+    # 1. Official Reddit oEmbed for post title and thumbnail
+    try:
+        oembed_resp = session.get("https://www.reddit.com/oembed", params={"url": canonical_url}, timeout=10)
+        if oembed_resp.status_code == 200:
+            o_data = oembed_resp.json()
+            title = o_data.get("title", "")
+            if o_data.get("thumbnail_url"):
+                media_url = o_data.get("thumbnail_url")
+    except Exception as oe_err:
+        logging.warning(f"Reddit oembed error: {oe_err}")
+
+    # 2. Fetch comments and post data from RapidAPI
+    if RAPIDAPI_KEY and RAPIDAPI_KEY not in ("default_rapidapi_key", "api key here"):
+        try:
+            headers = {
+                "x-rapidapi-key": RAPIDAPI_KEY,
+                "x-rapidapi-host": REDDIT_RAPIDAPI_HOST
+            }
+            resp = session.get(
+                f"https://{REDDIT_RAPIDAPI_HOST}/getPostComments",
+                headers=headers,
+                params={"post_url": canonical_url},
+                timeout=20
+            )
+            if resp.status_code == 200:
+                res_data = resp.json()
+
+                # Extract post title & media URL from raw post listing
+                try:
+                    raw_data = res_data.get("data")
+                    if isinstance(raw_data, list) and len(raw_data) > 0:
+                        post_box = raw_data[0].get("data", {}).get("children", [{}])[0].get("data", {})
+                        if not title and post_box.get("title"):
+                            title = post_box.get("title")
+                        if post_box.get("is_video"):
+                            fb_url = post_box.get("media", {}).get("reddit_video", {}).get("fallback_url")
+                            if fb_url:
+                                media_url = fb_url
+                        elif post_box.get("url"):
+                            p_url = post_box.get("url")
+                            if "v.redd.it" in p_url or any(p_url.lower().split("?")[0].endswith(ext) for ext in SUPPORTED_MEDIA_EXTS):
+                                media_url = p_url
+                except Exception as p_err:
+                    logging.warning(f"Error parsing post metadata from Reddit response: {p_err}")
+
+                # Extract comments recursively across Reddit listing structure
+                def extract_comments_recursive(obj):
+                    extracted = []
+                    if isinstance(obj, dict):
+                        body = obj.get("body")
+                        author = obj.get("author")
+                        if body and isinstance(body, str) and body.strip() and author != "AutoModerator":
+                            extracted.append(body.strip())
+                        for v in obj.values():
+                            extracted.extend(extract_comments_recursive(v))
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            extracted.extend(extract_comments_recursive(item))
+                    return extracted
+
+                all_bodies = extract_comments_recursive(res_data)
+                max_comm = st.session_state.get("max_comments", 5) if "max_comments" in st.session_state else 5
+                for b in all_bodies[:max_comm]:
+                    cleaned = clean_text(b)
+                    if cleaned:
+                        comments.append({"text": cleaned})
+
+                logging.info(f"RapidAPI Reddit: retrieved {len(comments)} comments.")
+        except Exception as ra_err:
+            logging.warning(f"RapidAPI Reddit comments fetch error: {ra_err}")
+
+    # If media_url is still original URL, default to canonical_url
+    if media_url == url:
+        media_url = canonical_url
+
+    return {
+        "platform": "reddit",
+        "title": clean_text(title),
+        "comments": comments,
+        "media_url": media_url
+    }
+
+
+def extract_youtube_video_id(url):
+    """Extracts YouTube video ID from various YouTube URL formats (watch, shorts, embed)."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.hostname in ('youtu.be', 'www.youtu.be'):
+            return parsed.path.lstrip('/')
+        if parsed.hostname in ('youtube.com', 'www.youtube.com', 'm.youtube.com'):
+            if parsed.path == '/watch':
+                return urllib.parse.parse_qs(parsed.query).get('v', [None])[0]
+            if parsed.path.startswith('/shorts/'):
+                parts = parsed.path.split('/')
+                return parts[2].split('?')[0] if len(parts) > 2 else None
+            if parsed.path.startswith('/embed/'):
+                parts = parsed.path.split('/')
+                return parts[2].split('?')[0] if len(parts) > 2 else None
+    except Exception:
+        pass
+    return None
+
+
+def fetch_youtube_comments(video_id, max_results=5):
+    """Fetches top-level YouTube comments via YouTube Data API v3."""
+    comments = []
+    if not video_id or not YOUTUBE_API_KEY or YOUTUBE_API_KEY in ("default_youtube_key", "api key here"):
+        return comments
+    try:
+        youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
+        res = youtube.commentThreads().list(
+            part="snippet",
+            videoId=video_id,
+            maxResults=max_results,
+            textFormat="plainText"
+        ).execute()
+        for item in res.get("items", []):
+            txt = item.get("snippet", {}).get("topLevelComment", {}).get("snippet", {}).get("textDisplay", "")
+            if txt and txt.strip():
+                comments.append({"text": clean_text(txt)})
+        logging.info(f"YouTube Data API: retrieved {len(comments)} comments for video {video_id}.")
+    except Exception as e:
+        logging.warning(f"YouTube Data API comments fetch error: {e}")
+    return comments
+
+
 def fetch_social_media_data(url, session):
     """
     Fetches metadata (title, comments, and media URL) for a given social media post URL.
-
-    ✅ FIXES:
-    - Proper Reddit handling using PRAW (no yt-dlp for Reddit images/videos).
-    - Handles Reddit galleries and image-only posts.
-    - Uses RapidAPI for Instagram/TikTok/Twitter/Facebook/Pinterest/YouTube.
-    - Returns direct media_url (image/video/audio) for downstream analysis.
-    - Added robust handling for lists/dicts and image-only URLs from RapidAPI.
     """
-
     logging.info(f"Fetching data: {url}")
 
     SUPPORTED_MEDIA_EXTS = (
@@ -946,89 +1090,75 @@ def fetch_social_media_data(url, session):
         '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'  # image
     )
 
+    if not url or not validators.url(url):
+        st.error("Invalid URL format.")
+        return None
+
     try:
         # --- REDDIT ---
         if "reddit.com" in url or "redd.it" in url:
             logging.info("Handling as Reddit URL...")
 
-            # Ensure Reddit credentials exist
-            if not all([REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT]):
-                st.error("Reddit API credentials missing in environment variables.")
-                logging.error("Reddit API credentials missing.")
-                return None
+            praw_available = (
+                REDDIT_CLIENT_ID and REDDIT_CLIENT_ID not in ("Client Id", "default_reddit_id") and
+                REDDIT_CLIENT_SECRET and REDDIT_CLIENT_SECRET not in ("Secret Key", "default_reddit_secret")
+            )
 
-            try:
-                # Initialize PRAW Reddit client (explicit, only for Reddit)
-                reddit = praw.Reddit(
-                    client_id=REDDIT_CLIENT_ID,
-                    client_secret=REDDIT_CLIENT_SECRET,
-                    user_agent=REDDIT_USER_AGENT
-                )
-                submission = reddit.submission(url=url)
-                title = submission.title if hasattr(submission, "title") else ""
-                author = submission.author
-                if author is None:
-                    st.error("Reddit post appears deleted or removed.")
-                    logging.error(f"Reddit post {url} has no author.")
-                    return None
-            except Exception as e:
-                st.error(f"Failed to access Reddit API: {e}")
-                logging.error(f"Reddit API failure: {traceback.format_exc()}")
-                return None
+            # Try PRAW if valid developer credentials exist
+            if praw_available:
+                try:
+                    reddit = praw.Reddit(
+                        client_id=REDDIT_CLIENT_ID,
+                        client_secret=REDDIT_CLIENT_SECRET,
+                        user_agent=REDDIT_USER_AGENT
+                    )
+                    submission = reddit.submission(url=url)
+                    title = submission.title if hasattr(submission, "title") else ""
+                    author = submission.author
+                    if author is not None:
+                        submission.comments.replace_more(limit=0)
+                        max_comments = st.session_state.get('max_comments', 5)
+                        comments_data = [getattr(c, "body", "") for c in submission.comments.list()[:max_comments] if hasattr(c, "body")]
 
-            try:
-                # --- Comments (top-level) ---
-                submission.comments.replace_more(limit=0)
-                max_comments = st.session_state.get('max_comments', 5)
-                comments_data = [getattr(c, "body", "") for c in submission.comments.list()[:max_comments] if hasattr(c, "body")]
+                        media_urls = []
+                        if getattr(submission, "is_gallery", False):
+                            for item in submission.gallery_data["items"]:
+                                media_id = item["media_id"]
+                                img_info = submission.media_metadata.get(media_id, {})
+                                if "s" in img_info and "u" in img_info["s"]:
+                                    img_url = img_info["s"]["u"].split("?")[0].replace("amp;", "")
+                                    if validators.url(img_url):
+                                        media_urls.append(img_url)
 
-                # --- Media Extraction ---
-                media_urls = []
+                        if hasattr(submission, "media") and submission.media:
+                            reddit_video = submission.media.get("reddit_video", {})
+                            if "fallback_url" in reddit_video:
+                                video_url = reddit_video["fallback_url"].split("?")[0]
+                                if validators.url(video_url):
+                                    media_urls.append(video_url)
+                        elif hasattr(submission, "url") and validators.url(submission.url):
+                            temp_url = submission.url.split("?")[0]
+                            if any(temp_url.lower().endswith(ext) for ext in SUPPORTED_MEDIA_EXTS):
+                                media_urls.append(temp_url)
+                            elif "v.redd.it" in temp_url:
+                                media_urls.append(temp_url)
 
-                # Case 1: Reddit gallery (multi-image)
-                if getattr(submission, "is_gallery", False):
-                    for item in submission.gallery_data["items"]:
-                        media_id = item["media_id"]
-                        img_info = submission.media_metadata.get(media_id, {})
-                        if "s" in img_info and "u" in img_info["s"]:
-                            img_url = img_info["s"]["u"].split("?")[0].replace("amp;", "")
-                            if validators.url(img_url):
-                                media_urls.append(img_url)
-                    logging.info(f"Extracted {len(media_urls)} images from Reddit gallery.")
+                        if not media_urls:
+                            media_urls.append(submission.url)
 
-                # Case 2: Reddit video
-                if hasattr(submission, "media") and submission.media:
-                    reddit_video = submission.media.get("reddit_video", {})
-                    if "fallback_url" in reddit_video:
-                        video_url = reddit_video["fallback_url"].split("?")[0]
-                        if validators.url(video_url):
-                            media_urls.append(video_url)
-                            logging.info(f"Reddit video found: {video_url}")
+                        formatted_comments = [{"text": clean_text(c)} for c in comments_data if c]
+                        return {
+                            "platform": "reddit",
+                            "title": clean_text(title),
+                            "comments": formatted_comments,
+                            "media_url": media_urls[0]
+                        }
+                except Exception as praw_err:
+                    logging.warning(f"PRAW Reddit access failed: {praw_err}. Attempting RapidAPI Reddit fallback...")
 
-                # Case 3: Direct image post
-                elif hasattr(submission, "url") and validators.url(submission.url):
-                    temp_url = submission.url.split("?")[0]
-                    if any(temp_url.lower().endswith(ext) for ext in SUPPORTED_MEDIA_EXTS):
-                        media_urls.append(temp_url)
-                    elif "v.redd.it" in temp_url:
-                        media_urls.append(temp_url)
-
-                if not media_urls:
-                    media_urls.append(submission.url)
-
-                formatted_comments = [{"text": clean_text(c)} for c in comments_data if c]
-
-                return {
-                    "platform": "reddit",
-                    "title": clean_text(title),
-                    "comments": formatted_comments,
-                    "media_url": media_urls[0]
-                }
-
-            except Exception as e:
-                st.error(f"Error processing Reddit data: {e}")
-                logging.error(f"Reddit processing error: {traceback.format_exc()}")
-                return None
+            # Fallback: RapidAPI Reddit scraper + oEmbed
+            logging.info("Using RapidAPI Reddit integration for comments and media...")
+            return fetch_reddit_via_rapidapi(url, session)
 
         # --- TWITTER / X (Direct parser for tweets with images or videos) ---
         elif any(x in url.lower() for x in ["twitter.com", "x.com"]):
@@ -1149,10 +1279,18 @@ def fetch_social_media_data(url, session):
                 logging.error(f"RapidAPI error: {traceback.format_exc()}")
                 media_url = url
 
+            # If YouTube URL, fetch real comments using YouTube Data API v3
+            yt_id = extract_youtube_video_id(url)
+            other_comments = []
+            if yt_id:
+                platform = "youtube"
+                max_comm = st.session_state.get('max_comments', 5)
+                other_comments = fetch_youtube_comments(yt_id, max_results=max_comm)
+
             return {
                 "platform": platform,
                 "title": clean_text(title),
-                "comments": [],
+                "comments": other_comments,
                 "media_url": media_url
             }
 
@@ -1187,34 +1325,32 @@ def download_media(url, session):
         logging.warning(f"Invalid or missing URL for download: {url}")
         return None, None
 
-    # --- Reddit check ---
+    # --- Reddit direct stream check ---
     if any(x in url for x in ["reddit.com", "redd.it", "v.redd.it", "preview.redd.it", "i.redd.it"]):
-        logging.info(f"Skipping yt-dlp for Reddit URL (handled by PRAW): {url}")
         headers = {"User-Agent": REDDIT_USER_AGENT or "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         try:
-            head = session.head(url, allow_redirects=True, headers=headers, timeout=100)
+            head = session.head(url, allow_redirects=True, headers=headers, timeout=10)
             ctype = (head.headers.get("content-type") or "").lower()
             ext = os.path.splitext(urllib.parse.urlparse(url).path)[1]
             if "image/" in ctype or ext.lower() in IMAGE_EXTS:
                 local = os.path.join(TEMP_DIR, f"media_{int(time.time())}{ext or '.jpg'}")
-                with session.get(url, stream=True, headers=headers, timeout=600) as r:
+                with session.get(url, stream=True, headers=headers, timeout=60) as r:
                     r.raise_for_status()
                     with open(local, "wb") as f:
                         shutil.copyfileobj(r.raw, f)
                 return local, "image"
             elif "video/" in ctype or ext.lower() in VIDEO_EXTS:
                 local = os.path.join(TEMP_DIR, f"media_{int(time.time())}{ext or '.mp4'}")
-                with session.get(url, stream=True, headers=headers, timeout=600) as r:
+                with session.get(url, stream=True, headers=headers, timeout=60) as r:
                     r.raise_for_status()
                     with open(local, "wb") as f:
                         shutil.copyfileobj(r.raw, f)
                 return local, "video"
         except Exception as e:
-            logging.error(f"Reddit download failed: {traceback.format_exc()}")
-            return None, None
-        return None, None
+            logging.warning(f"Direct Reddit media download attempt failed: {e}")
+        # Note: If not a direct image/video, fall through to yt-dlp (which handles Reddit videos/v.redd.it)
 
-    logging.info(f"Attempting download (non-Reddit): {url}")
+    logging.info(f"Attempting download: {url}")
 
     try:
         head = session.head(url, allow_redirects=True, timeout=10)
