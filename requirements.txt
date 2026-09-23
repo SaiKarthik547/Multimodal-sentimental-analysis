@@ -1,28 +1,48 @@
-# Compatible with Python 3.10 and 3.11 (TensorFlow / DeepFace requirement)
+# ==============================================================================
+# Multimodal Social Media Sentiment Analysis - Requirements
+# Python compatibility: Python 3.10 or 3.11 recommended
+# ==============================================================================
+
+# Core Framework & UI
 streamlit
-numpy
+setuptools<70.0.0
+
+# Numerical & Data Processing
+numpy<2.0.0
+pandas==2.2.3
+scikit-learn==1.5.2
+psutil
+
+# Web, API & Social Media Fetching
 requests
 praw
 yt-dlp
-pillow
-moviepy<2.0.0
-soundfile
-librosa
-transformers
-torch>=2.2.0,<2.6.0
-torchvision>=0.17.0,<0.21.0
-easyocr
-fer
-deepface
-matplotlib
-seaborn
 python-dotenv
 validators
 emoji
 google-api-python-client
 retry
-tf-keras
+
+# Media Processing (Images, Audio, Video)
+pillow
+moviepy<2.0.0
+imageio-ffmpeg
+soundfile
+librosa
+
+# Deep Learning & Vision (CPU & GPU portable)
+torch>=2.2.0,<2.6.0
+torchvision>=0.17.0,<0.21.0
+bitsandbytes
+transformers<5.0.0
 sentencepiece
-pandas
-psutil
-scikit-learn
+tf-keras
+
+# OCR & Emotion Recognition
+easyocr
+fer==22.5.1
+deepface
+
+# Visualization
+matplotlib
+seaborn

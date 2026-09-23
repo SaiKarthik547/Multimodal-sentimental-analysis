@@ -30,6 +30,19 @@ import emoji
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import shutil 
+import imageio_ffmpeg
+
+# Configure FFmpeg in PATH from imageio_ffmpeg for yt-dlp & moviepy
+try:
+    _ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    _ffmpeg_dir = os.path.dirname(_ffmpeg_exe)
+    _ffmpeg_alias = os.path.join(_ffmpeg_dir, 'ffmpeg.exe')
+    if not os.path.exists(_ffmpeg_alias):
+        shutil.copyfile(_ffmpeg_exe, _ffmpeg_alias)
+    if _ffmpeg_dir not in os.environ.get('PATH', ''):
+        os.environ['PATH'] = _ffmpeg_dir + os.pathsep + os.environ.get('PATH', '')
+except Exception as _ff_err:
+    logging.warning(f"Could not configure imageio ffmpeg path: {_ff_err}")
 
 # --- Added for Metrics ---
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, ConfusionMatrixDisplay
@@ -1017,6 +1030,43 @@ def fetch_social_media_data(url, session):
                 logging.error(f"Reddit processing error: {traceback.format_exc()}")
                 return None
 
+        # --- TWITTER / X (Direct parser for tweets with images or videos) ---
+        elif any(x in url.lower() for x in ["twitter.com", "x.com"]):
+            logging.info(f"Fetching Twitter/X post: {url}")
+            platform = "twitter"
+            title = ""
+            media_url = url
+            try:
+                parsed = urllib.parse.urlparse(url)
+                path = parsed.path
+                vx_url = f"https://api.vxtwitter.com{path}"
+                res = session.get(vx_url, timeout=15)
+                if res.status_code == 200:
+                    tweet_data = res.json()
+                    title = tweet_data.get("text", "")
+                    media_urls = tweet_data.get("mediaURLs") or []
+                    if media_urls:
+                        media_url = media_urls[0]
+                    logging.info(f"Twitter extracted: Title='{title[:40]}...', MediaURL={media_url}")
+                else:
+                    fx_url = f"https://api.fxtwitter.com{path}"
+                    res = session.get(fx_url, timeout=15)
+                    if res.status_code == 200:
+                        tweet_data = res.json().get("tweet", {})
+                        title = tweet_data.get("text", "")
+                        media_list = tweet_data.get("media", {}).get("photos", []) or tweet_data.get("media", {}).get("videos", [])
+                        if media_list and isinstance(media_list, list):
+                            media_url = media_list[0].get("url")
+            except Exception as tw_err:
+                logging.warning(f"Twitter direct extraction error: {tw_err}")
+
+            return {
+                "platform": platform,
+                "title": clean_text(title),
+                "comments": [],
+                "media_url": media_url
+            }
+
         # --- OTHER PLATFORMS (YouTube, Instagram, TikTok, etc.) ---
         else:
             logging.info(f"Fetching via RapidAPI for non-Reddit URL: {url}")
@@ -1042,14 +1092,21 @@ def fetch_social_media_data(url, session):
 
                 title = data.get("caption") or data.get("title", "")
                 platform = data.get("platform", "unknown")
-                possible_media = data.get("media_url") or data.get("media") or url
+                possible_media = data.get("download_links") or data.get("media_url") or data.get("media")
 
                 candidate = None
 
-                if isinstance(possible_media, list) and possible_media:
+                # Check download_details (common in Instagram / media API responses)
+                if isinstance(data.get("download_details"), dict):
+                    dl = data.get("download_details")
+                    candidate = dl.get("download_url") or dl.get("thumb")
+                    if not title:
+                        title = dl.get("caption") or ""
+
+                if not candidate and isinstance(possible_media, list) and possible_media:
                     for item in possible_media:
                         if isinstance(item, dict):
-                            for k in ("url", "src", "link"):
+                            for k in ("url", "src", "link", "download_url"):
                                 val = item.get(k)
                                 if val and validators.url(val):
                                     candidate = val
@@ -1058,20 +1115,35 @@ def fetch_social_media_data(url, session):
                             candidate = item
                             break
 
-                elif isinstance(possible_media, dict):
-                    for k in ("url", "src", "link"):
+                elif not candidate and isinstance(possible_media, dict):
+                    for k in ("url", "src", "link", "download_url"):
                         val = possible_media.get(k)
                         if val and validators.url(val):
                             candidate = val
                             break
 
-                elif isinstance(possible_media, str) and validators.url(possible_media):
+                elif not candidate and isinstance(possible_media, str) and validators.url(possible_media):
                     candidate = possible_media
+
+                if not candidate:
+                    for k in ("images", "photos", "thumbnail", "thumb", "download_url"):
+                        val = data.get(k)
+                        if val:
+                            if isinstance(val, str) and validators.url(val):
+                                candidate = val
+                                break
+                            elif isinstance(val, list) and val and isinstance(val[0], str) and validators.url(val[0]):
+                                candidate = val[0]
+                                break
 
                 if not candidate:
                     candidate = url
 
-                media_url = candidate.split("?")[0]
+                # Only strip query parameters for static images; preserve video/social URLs
+                if any(candidate.lower().split("?")[0].endswith(ext) for ext in ('.jpg', '.jpeg', '.png', '.webp', '.gif')):
+                    media_url = candidate.split("?")[0]
+                else:
+                    media_url = candidate
 
             except Exception as e:
                 logging.error(f"RapidAPI error: {traceback.format_exc()}")
@@ -1151,7 +1223,7 @@ def download_media(url, session):
         ctype = ""
 
     # --- Direct image ---
-    if "image/" in ctype or any(url.lower().endswith(ext) for ext in IMAGE_EXTS):
+    if "image/" in ctype or any(url.lower().split("?")[0].endswith(ext) for ext in IMAGE_EXTS):
         logging.info("Detected image via HEAD or extension; downloading with requests.")
         ext = os.path.splitext(url.split("?")[0])[1] or ".jpg"
         local = os.path.join(TEMP_DIR, f"media_{int(time.time())}{ext}")
@@ -1162,8 +1234,26 @@ def download_media(url, session):
         return local, "image"
 
     # --- Direct video/audio ---
-    if "video/" in ctype or any(url.lower().endswith(ext) for ext in VIDEO_EXTS + AUDIO_EXTS):
-        logging.info("Detected video/audio file — Using yt-dlp for non-Reddit video download.")
+    if "video/" in ctype or "audio/" in ctype or any(url.lower().split("?")[0].endswith(ext) for ext in VIDEO_EXTS + AUDIO_EXTS):
+        logging.info("Detected video/audio stream; attempting direct download with requests.")
+        ext = ".mp4" if "video/" in ctype else ".mp3"
+        for test_ext in VIDEO_EXTS + AUDIO_EXTS:
+            if url.lower().split("?")[0].endswith(test_ext):
+                ext = test_ext
+                break
+        local = os.path.join(TEMP_DIR, f"media_{int(time.time())}{ext}")
+        try:
+            with session.get(url, stream=True, timeout=90) as r:
+                r.raise_for_status()
+                with open(local, "wb") as f:
+                    shutil.copyfileobj(r.raw, f)
+            if os.path.exists(local) and os.path.getsize(local) > 0:
+                mtype = "video" if ext in VIDEO_EXTS or "video/" in ctype else "audio"
+                return local, mtype
+        except Exception as dl_err:
+            logging.warning(f"Direct stream download failed, attempting yt-dlp: {dl_err}")
+
+        # Fallback to yt-dlp for video if direct download failed
         try:
             ydl_opts = {
                 "quiet": True,
@@ -1171,9 +1261,9 @@ def download_media(url, session):
                 "noplaylist": True,
                 "retries": 3,
                 "socket_timeout": 45,
-                "format": "bestvideo+bestaudio/best",
+                "format": "best[ext=mp4]/bestvideo+bestaudio/best",
                 "merge_output_format": "mp4",
-                "outtmpl": os.path.join(TEMP_DIR, "media_%(id)s.%(ext)s")
+                "outtmpl": os.path.join(TEMP_DIR, f"media_{int(time.time())}.%(ext)s")
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -1198,9 +1288,9 @@ def download_media(url, session):
             "noplaylist": True,
             "retries": 3,
             "socket_timeout": 45,
-            "format": "bestvideo+bestaudio/best",
+            "format": "best[ext=mp4]/bestvideo+bestaudio/best",
             "merge_output_format": "mp4",
-            "outtmpl": os.path.join(TEMP_DIR, "media_%(id)s.%(ext)s")
+            "outtmpl": os.path.join(TEMP_DIR, f"media_{int(time.time())}.%(ext)s")
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -1214,6 +1304,30 @@ def download_media(url, session):
             return dl_path, "unknown"
     except Exception as e:
         logging.error(f"Final yt-dlp fallback failed: {traceback.format_exc()}")
+        # Check if the page has an og:image or twitter:image metadata tag (e.g. photo tweets, articles)
+        try:
+            logging.info("Checking page HTML for og:image or twitter:image fallback...")
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            page_resp = session.get(url, headers=headers, timeout=15)
+            if page_resp.status_code == 200:
+                html_text = page_resp.text
+                match = re.search(r'<meta\s+(?:property|name)=["\'](?:og:image|twitter:image(?::src)?)["\']\s+content=["\']([^"\']+)["\']', html_text, re.IGNORECASE)
+                if not match:
+                    match = re.search(r'content=["\']([^"\']+)["\']\s+(?:property|name)=["\'](?:og:image|twitter:image(?::src)?)["\']', html_text, re.IGNORECASE)
+                if match:
+                    img_url = match.group(1)
+                    if validators.url(img_url):
+                        logging.info(f"Found image in page meta tags: {img_url}")
+                        ext = os.path.splitext(img_url.split("?")[0])[1] or ".jpg"
+                        local = os.path.join(TEMP_DIR, f"media_{int(time.time())}{ext}")
+                        with session.get(img_url, stream=True, headers=headers, timeout=30) as r:
+                            r.raise_for_status()
+                            with open(local, "wb") as f:
+                                shutil.copyfileobj(r.raw, f)
+                        if os.path.exists(local) and os.path.getsize(local) > 0:
+                            return local, "image"
+        except Exception as img_err:
+            logging.warning(f"Fallback og:image extraction failed: {img_err}")
 
     logging.error("Media download failed or was skipped.")
     return None, None
@@ -2419,10 +2533,9 @@ def main():
     """Main Streamlit application function."""
     # Run DB init and preload only once at the start
     if 'db_initialized' not in st.session_state:
-        table_was_created = init_db()
-        # Preload data only if the table was newly created to avoid duplicates
-        if table_was_created:
-            preload_data_from_csv(SAMPLE_CSV_PATH)
+        init_db()
+        # Preload data if not already present (internally checks for existing sample data)
+        preload_data_from_csv(SAMPLE_CSV_PATH)
         st.session_state.db_initialized = True # Mark DB as initialized
 
     # Clean temp dir on each run (safer if previous run crashed)
