@@ -110,60 +110,28 @@ The application uses an ensemble of transformer models to analyze sentiment from
 git clone [https://github.com/SaiKarthik547/Multimodal-sentimental-analysis.git](https://github.com/SaiKarthik547/Multimodal-sentimental-analysis.git)
 cd Multimodal-sentimental-analysis
 
-### 2\. Create a Virtual Environment (Recommended)
+### 2. Python Version & Virtual Environment
+
+> [!IMPORTANT]
+> **Python 3.10 or 3.11** is required. Newer versions like Python 3.13 or 3.14 do not yet have compatible wheels for TensorFlow/DeepFace.
 
 ```bash
-# Windows
-python -m venv venv
+# Windows (using Python 3.11)
+py -3.11 -m venv venv
 .\venv\Scripts\activate
 
 # macOS / Linux
-python3 -m venv venv
+python3.11 -m venv venv
 source venv/bin/activate
 ```
 
-### 3\. Install Dependencies
+### 3. Install Dependencies
 
-The provided `requirements.txt` file contains most dependencies. The `app.py` file also explicitly uses `pandas` and `scikit-learn`, which are included in the list below.
+All dependencies are included in `requirements.txt`:
 
 ```bash
-# Install from the provided requirements file
 pip install -r requirements.txt
-
-# Install packages imported in app.py but missing from the file
-pip install pandas scikit-learn
 ```
-
-**Full `requirements.txt` content (for reference):**
-
-```
-streamlit
-numpy
-requests
-praw
-yt-dlp
-pillow
-moviepy
-soundfile
-librosa
-transformers
-torch-directml # Note: This is for DirectML on AMD. If using NVIDIA, you'd want 'torch' and 'torchvision' with CUDA.
-bitsandbytes
-easyocr
-fer
-deepface
-matplotlib
-seaborn
-python-dotenv
-validators
-emoji
-google-api-python-client
-retry
-tf-keras
-sentencepiece
-```
-
-*(Note: `torch-directml` implies this is set up for an AMD GPU. If you have an NVIDIA GPU, you should install PyTorch with CUDA support. If you have no GPU, you can install the CPU version of PyTorch (`pip install torch torchvision torchaudio`))*
 
 ### 4\. Set Up API Keys
 

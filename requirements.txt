@@ -1,15 +1,16 @@
+# Compatible with Python 3.10 and 3.11 (TensorFlow / DeepFace requirement)
 streamlit
 numpy
 requests
 praw
 yt-dlp
 pillow
-moviepy
+moviepy<2.0.0
 soundfile
 librosa
 transformers
-torch-directml
-bitsandbytes
+torch>=2.2.0,<2.6.0
+torchvision>=0.17.0,<0.21.0
 easyocr
 fer
 deepface
